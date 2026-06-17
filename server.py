@@ -1,361 +1,621 @@
 # -*- coding: utf-8 -*-
 """
-어린이집사 — 보육행정 검증 에이전트 MCP 서버 (Agentic Player 10 출품)
-====================================================================
-"AI는 행정을 수행하고, 인간은 판단하며, 시간은 아이에게 돌아간다."
+보육나침반 — 근거 기반 보육행정 MCP 서버
+=========================================
+목표: 흩어진 보육행정 기준을 찾아 공문·체크리스트·검토자료로 연결한다.
+원칙: AI는 근거 확인과 문서화를 돕고, 최종 판단은 사람이 한다.
 
-분산된 보육행정을 AI가 수행·검증하고, 사람은 판단에 집중하도록 돕는다.
-모든 응답은 실제 지침서·법령 '근거'에 기반한다. (서버 내장 지침 + 법제처 법령 API)
+자료 구조
+- guideline_index.json: 보육사업안내, 부록, 표준보육과정, 평가매뉴얼, 재무회계매뉴얼,
+  누리과정 자료 등을 텍스트 조각으로 색인한 파일.
+- 법령: 법제처 국가법령정보 API(lawSearch.do + lawService.do)로 실시간 조회.
 
-설계 원칙:
-  - 자연스러운 문장 생성은 호스트 AI가 한다.
-  - 이 서버는 정확한 근거(지침 원문·법령), 서식, 절차, 검증 프레임을 제공한다.
-  - 어떤 입력에도 절대 예외(오류)로 죽지 않는다. 모든 도구는 항상 문자열을 반환한다.
-
-내장 자료(검색): 2026 보육사업안내(본문/부록), 2025 재무회계 매뉴얼,
-  2024 개정 표준보육과정(해설서/0-1세/2세 실행자료), 2019 개정 누리과정 놀이실행자료.
+필수 환경변수
+- LAW_GO_KR_OC: 법제처 Open API OC 값. 기본값은 공모전 개발용 yatyat0404.
+- LAW_DEBUG=true: 법제처 호출 실패 원인을 응답에 표시.
+- PORT: streamable-http 실행 포트. 기본 8000.
+- MCP_TRANSPORT=streamable-http: PlayMCP/KC 배포 시 사용.
 """
 
+import json
+import math
 import os
 import re
-import json
 from datetime import date
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception:  # 로컬 문법검사용 안전장치
+    FastMCP = None  # type: ignore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("PORT", "8000"))
+SERVICE_NAME = "boyuk-compass"
 
-mcp = FastMCP("childcare-admin", host="0.0.0.0", port=PORT)
+if FastMCP:
+    mcp = FastMCP(SERVICE_NAME, host="0.0.0.0", port=PORT)
+else:
+    class _DummyMCP:
+        def tool(self):
+            def deco(fn):
+                return fn
+            return deco
+        def run(self, *args, **kwargs):
+            return None
+    mcp = _DummyMCP()
 
-try:
-    오늘 = date.today().isoformat()
-except Exception:
-    오늘 = ""
+TODAY = date.today().isoformat()
+LAW_OC = os.environ.get("LAW_GO_KR_OC", "yatyat0404").strip()
+LAW_DEBUG = os.environ.get("LAW_DEBUG", "false").lower() in {"1", "true", "yes", "y"}
 
 # ──────────────────────────────────────────────────────────────
-# 지침 검색 엔진 (서버 내장 — 항상 동작)
+# 1. 문서 색인 로딩
 # ──────────────────────────────────────────────────────────────
-try:
-    with open(os.path.join(HERE, "guideline_index.json"), encoding="utf-8") as _f:
-        GUIDELINE_INDEX = json.load(_f)
-    if not isinstance(GUIDELINE_INDEX, list):
-        GUIDELINE_INDEX = []
-except Exception:
-    GUIDELINE_INDEX = []
+INDEX_CANDIDATES = [
+    os.path.join(HERE, "guideline_index.json"),
+    os.path.join(HERE, "data", "index", "childcare_chunks.json"),
+    os.path.join(HERE, "data", "index", "childcare_chunks.jsonl"),
+]
 
-
-_STOP = {"있는", "하는", "해야", "되는", "관련", "대한", "그리고", "어떻게", "무엇", "알려",
-         "지침", "법령", "근거", "확인", "이것", "저것", "거야", "인지", "되나", "되어"}
-
-
-def _tokenize(s):
-    try:
-        return [t for t in re.findall(r"[가-힣A-Za-z0-9]+", str(s)) if len(t) >= 2]
-    except Exception:
-        return []
-
-
-def _ngrams(word, n=2):
-    """단어를 글자 n-gram으로. (한국어 단어 변형에도 잘 걸리도록)"""
-    try:
-        w = str(word)
-        if len(w) < n:
-            return [w] if w else []
-        return [w[i:i + n] for i in range(len(w) - n + 1)]
-    except Exception:
-        return []
-
-
-import math as _math
-
-# 보육 행정 동의어 — 질문 단어와 자료 단어가 달라도 찾도록 확장
-_SYNONYMS = {
-    "부모": ["학부모", "보호자"], "부모위원": ["학부모", "보호자", "학부모대표"],
-    "학부모": ["보호자", "부모"], "보호자": ["학부모", "부모"],
-    "비율": ["2분의", "이상", "정수", "이내"], "정수": ["2분의", "이상", "이내"],
-    "교사": ["보육교사", "교직원"], "교직원": ["보육교사", "교사"],
-    "채용": ["임용", "자격", "결격"], "임용": ["채용", "자격"],
-    "집행": ["계정", "예산", "지출"], "회계": ["재무", "계정", "예산"],
-    "급식": ["위생", "식단"], "안전": ["점검", "비상", "재해"],
-    "놀이": ["영역", "배움"], "운영위원회": ["위원회", "운영위"],
+DOC_CATEGORY_ALIASES = {
+    "보육사업안내": ["보육사업", "사업안내", "2026", "본문", "부록"],
+    "보육사업안내 본문": ["보육사업안내 본문", "사업안내 본문", "본문"],
+    "보육사업안내 부록": ["보육사업안내 부록", "사업안내 부록", "부록"],
+    "표준보육과정": ["표준보육", "보육과정", "0·1세", "0-1세", "2세", "해설서", "실행자료"],
+    "0·1세 실행자료": ["0·1세", "0-1세", "0.1세", "영아", "실행자료"],
+    "2세 실행자료": ["2세", "실행자료"],
+    "해설서": ["해설서", "표준보육과정 해설"],
+    "평가매뉴얼": ["평가", "평가제", "평가매뉴얼", "어린이집 평가"],
+    "재무회계": ["재무", "회계", "재무회계", "지출", "예산", "결산", "계정"],
+    "누리과정": ["누리", "놀이실행", "3-5세", "유아"],
 }
 
-_DF = None
-_NDOCS = 0
+REQUIRED_DOCS = [
+    "2026년도 보육사업안내 본문",
+    "2026년도 보육사업안내 부록",
+    "2024 개정 표준보육과정 0·1세 실행자료",
+    "2024 개정 표준보육과정 2세 실행자료",
+    "2024 개정 표준보육과정 해설서",
+    "2024 개정 어린이집 평가 매뉴얼",
+    "어린이집 재무매뉴얼",
+    "누리과정 놀이실행자료",
+]
 
 
-def _build_df():
-    """글자 2-gram의 문서빈도(DF)를 1회 계산. 실패해도 안전(빈 표)."""
-    global _DF, _NDOCS
-    if _DF is not None:
+def _normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    try:
+        if path.endswith(".jsonl"):
+            rows = []
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+            return rows
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("chunks", "items", "data", "documents"):
+                if isinstance(data.get(key), list):
+                    return [x for x in data[key] if isinstance(x, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _coerce_chunk(item: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    """기존 guideline_index.json 형식도 새 색인 형식으로 통일."""
+    source = _normalize_text(item.get("source") or item.get("doc_title") or item.get("title") or "지침서")
+    text = _normalize_text(item.get("text") or item.get("content") or item.get("body") or "")
+    doc_title = _normalize_text(item.get("doc_title") or item.get("document") or source)
+    category = _normalize_text(item.get("category") or item.get("type") or _infer_category(doc_title + " " + source))
+    page = item.get("page") or item.get("page_no") or item.get("쪽수") or ""
+    section = _normalize_text(item.get("section") or item.get("heading") or item.get("chapter") or "")
+    keywords = item.get("keywords") if isinstance(item.get("keywords"), list) else []
+    return {
+        "chunk_id": item.get("chunk_id") or f"chunk_{idx:06d}",
+        "doc_id": item.get("doc_id") or _slugify(doc_title or source),
+        "doc_title": doc_title or source,
+        "category": category or "기타",
+        "source": source,
+        "page": str(page) if page else "",
+        "section": section,
+        "keywords": [str(k) for k in keywords],
+        "text": text,
+    }
+
+
+def _slugify(s: str) -> str:
+    s = re.sub(r"[^가-힣A-Za-z0-9]+", "_", s).strip("_")
+    return s[:80] or "document"
+
+
+def _infer_category(value: str) -> str:
+    v = str(value)
+    for cat, keys in DOC_CATEGORY_ALIASES.items():
+        if any(k in v for k in keys):
+            return cat
+    return "기타"
+
+
+def _load_guideline_index() -> List[Dict[str, Any]]:
+    raw: List[Dict[str, Any]] = []
+    for p in INDEX_CANDIDATES:
+        raw = _load_json_or_jsonl(p)
+        if raw:
+            break
+    chunks = [_coerce_chunk(item, idx) for idx, item in enumerate(raw)]
+    return [c for c in chunks if c.get("text")]
+
+
+GUIDELINE_INDEX = _load_guideline_index()
+
+# ──────────────────────────────────────────────────────────────
+# 2. 검색 엔진: 키워드 + n-gram + 문서분류 필터
+# ──────────────────────────────────────────────────────────────
+STOPWORDS = {
+    "있는", "하는", "해야", "되는", "관련", "대한", "그리고", "어떻게", "무엇", "알려", "지침", "법령", "근거",
+    "확인", "이것", "저것", "거야", "인지", "되나", "되어", "해주세요", "해줘", "어린이집", "보육", "행정"
+}
+
+SYNONYMS = {
+    "부모": ["학부모", "보호자"],
+    "학부모": ["보호자", "부모"],
+    "보호자": ["학부모", "부모"],
+    "교사": ["보육교사", "교직원", "담임"],
+    "교직원": ["보육교사", "교사", "보육교직원"],
+    "채용": ["임용", "자격", "결격", "범죄경력", "아동학대"],
+    "회계": ["재무", "예산", "결산", "계정", "지출", "증빙"],
+    "지출": ["집행", "계정", "예산", "증빙"],
+    "급식": ["위생", "식단", "간식", "재료"],
+    "안전": ["점검", "사고", "비상", "재해", "소방", "수질"],
+    "운영위원회": ["운영위", "위원회", "보호자위원", "학부모위원"],
+    "평가": ["평가제", "평가매뉴얼", "지표", "관찰", "상호작용"],
+    "놀이": ["배움", "지원", "표준보육과정", "영역"],
+    "건강검진": ["영유아건강검진", "검진", "미수검"],
+    "감염병": ["수족구", "등원중지", "전염", "예방"],
+}
+
+DF: Dict[str, int] = {}
+NDOCS = 0
+
+
+def _tokenize(s: Any) -> List[str]:
+    try:
+        return [t for t in re.findall(r"[가-힣A-Za-z0-9·ㆍ\-]+", str(s)) if len(t) >= 2 and t not in STOPWORDS]
+    except Exception:
+        return []
+
+
+def _ngrams(word: str, n: int = 2) -> List[str]:
+    w = str(word)
+    if len(w) < n:
+        return [w] if w else []
+    return [w[i:i + n] for i in range(len(w) - n + 1)]
+
+
+def _build_df() -> None:
+    global DF, NDOCS
+    if DF:
         return
-    df = {}
-    try:
-        _NDOCS = len(GUIDELINE_INDEX)
-        for item in GUIDELINE_INDEX:
-            txt = item.get("text", "")
-            seen = set()
-            for i in range(len(txt) - 1):
-                seen.add(txt[i:i + 2])
-            for g in seen:
-                df[g] = df.get(g, 0) + 1
-    except Exception:
-        df = {}
-    _DF = df
+    NDOCS = len(GUIDELINE_INDEX)
+    temp: Dict[str, int] = {}
+    for item in GUIDELINE_INDEX:
+        seen = set(_ngrams(item.get("text", ""), 2))
+        for g in seen:
+            temp[g] = temp.get(g, 0) + 1
+    DF = temp
 
 
-def _idf(g):
-    try:
-        if not _DF or _NDOCS <= 0:
-            return 1.0
-        return _math.log((_NDOCS + 1) / (_DF.get(g, 0) + 1)) + 1.0
-    except Exception:
+def _idf(g: str) -> float:
+    if not DF or NDOCS <= 0:
         return 1.0
+    return math.log((NDOCS + 1) / (DF.get(g, 0) + 1)) + 1.0
 
 
-def _query_concepts(query):
-    """질의 → [(핵심단어, 그 개념의 동의어 포함 2-gram 집합), ...]."""
-    words = [w for w in _tokenize(query) if w not in _STOP]
-    concepts = []
+def _expanded_terms(query: str) -> List[str]:
+    words = _tokenize(query)
+    out: List[str] = []
     for w in words:
-        terms = [w] + _SYNONYMS.get(w, [])
-        grams = set()
-        for t in terms:
-            for tok in _tokenize(t):
-                for g in _ngrams(tok, 2):
-                    grams.add(g)
-        concepts.append((w, grams))
-    return concepts
+        out.append(w)
+        out.extend(SYNONYMS.get(w, []))
+    # 복합어 보강
+    q = str(query)
+    for key, vals in SYNONYMS.items():
+        if key in q:
+            out.extend(vals)
+    seen, uniq = set(), []
+    for t in out:
+        if t and t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
 
 
-def _search_guidelines(query, topk=5, source_keyword=""):
-    """개념 커버리지 우선 + IDF 가중 검색.
+def _category_match_filter(category_hint: str) -> List[str]:
+    if not category_hint:
+        return []
+    hints = [category_hint]
+    for cat, aliases in DOC_CATEGORY_ALIASES.items():
+        if category_hint == cat or any(a in category_hint or category_hint in a for a in aliases):
+            hints.append(cat)
+            hints.extend(aliases)
+    return list(dict.fromkeys(hints))
 
-    핵심은 '질의가 담은 여러 개념을 두루 맞힌 문단'을 우선하는 것.
-    예: '운영위원회 + 부모 + 비율'을 모두 건드린 문단(=학부모 2분의 1 이상 규정)이,
-    '운영위원회 + 위반'만 맞은 처분 안내 문단보다 위로 온다.
-    흔한 글자는 약하게(낮은 IDF), 희귀한 글자(2분의 등)는 강하게 반영. 절대 예외 없음.
-    """
+
+def search_guidelines(query: str, topk: int = 5, category_hint: str = "") -> List[Dict[str, Any]]:
     try:
         _build_df()
-        concepts = _query_concepts(query)
-        if not concepts or not GUIDELINE_INDEX:
+        if not GUIDELINE_INDEX:
             return []
-        scored = []
+        terms = _expanded_terms(query)
+        if not terms:
+            return []
+        cat_filters = _category_match_filter(category_hint)
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        grams_by_term = {t: set(_ngrams(t, 2)) for t in terms}
         for item in GUIDELINE_INDEX:
-            try:
-                txt = item.get("text", "")
-                src = item.get("source", "")
-                if source_keyword and source_keyword not in src:
-                    continue
-                score = 0.0
-                any_match = False
-                for w, grams in concepts:
-                    best = 0.0          # 이 개념을 맞힌 글자 중 '가장 특징적인(희귀한)' 값
-                    for g in grams:
-                        if g in txt:
-                            idf = _idf(g)
-                            if idf > best:
-                                best = idf
-                    if best > 0:
-                        any_match = True
-                        score += best   # 개념마다 최고값만 더함 → 흔한 글자 남발에 안 휘둘림
-                    if len(w) >= 2 and w in txt:
-                        score += 2.0     # 핵심 단어 통째 일치 보너스
-                if not any_match:
-                    continue
-                scored.append((score, item))
-            except Exception:
+            hay = " ".join([
+                item.get("doc_title", ""), item.get("category", ""), item.get("section", ""),
+                " ".join(item.get("keywords", [])), item.get("text", "")
+            ])
+            if cat_filters and not any(f in hay for f in cat_filters):
                 continue
+            score = 0.0
+            matched_terms = 0
+            for term, grams in grams_by_term.items():
+                if term in hay:
+                    score += 3.0
+                    matched_terms += 1
+                best = 0.0
+                for g in grams:
+                    if g and g in hay:
+                        best = max(best, _idf(g))
+                if best:
+                    score += best
+                    matched_terms += 0.25
+            # 여러 개념을 함께 맞춘 문단 가산점
+            score += min(matched_terms, 5) * 0.7
+            if score > 0:
+                scored.append((score, item))
         scored.sort(key=lambda x: -x[0])
-        out = []
-        for _score, item in scored[:topk]:
-            snippet = re.sub(r"\s+", " ", item.get("text", "")).strip()
-            out.append({"source": item.get("source", "지침서"), "text": snippet[:500]})
-        return out
+        return [item for _, item in scored[:topk]]
     except Exception:
         return []
 
 
+def _format_guideline_hit(hit: Dict[str, Any], idx: int) -> str:
+    src = hit.get("doc_title") or hit.get("source") or "지침서"
+    page = f" p.{hit.get('page')}" if hit.get("page") else ""
+    section = f" / {hit.get('section')}" if hit.get("section") else ""
+    text = _normalize_text(hit.get("text", ""))[:800]
+    return f"{idx}. {src}{page}{section}\n   {text}"
+
 # ──────────────────────────────────────────────────────────────
-# 법제처 법령 API (best-effort, 실패해도 절대 안 죽음)
+# 3. 법제처 API: 검색 → 본문 조회 → 조문 검색
 # ──────────────────────────────────────────────────────────────
-LAW_OC = os.environ.get("LAW_GO_KR_OC", "yatyat4542")
+IMPORTANT_LAWS = [
+    "영유아보육법",
+    "영유아보육법 시행령",
+    "영유아보육법 시행규칙",
+    "사회복지사업법",
+    "사회복지법인 및 사회복지시설 재무ㆍ회계 규칙",
+    "아동복지법",
+    "개인정보 보호법",
+    "감염병의 예방 및 관리에 관한 법률",
+]
 
 
-def _fetch_law_names(query, topk=4):
-    """법제처 OPEN API로 관련 법령명 조회. 어떤 경우에도 리스트 반환(예외 없음)."""
+def _law_debug_msg(msg: str) -> List[Dict[str, str]]:
+    if LAW_DEBUG:
+        return [{"law_name": "[디버그]", "message": msg}]
+    return []
+
+
+def _http_get_json(url: str, params: Dict[str, Any], timeout: float = 7.0) -> Tuple[Optional[Any], str]:
     try:
         import httpx
-
-        url = "https://www.law.go.kr/DRF/lawSearch.do"
-        params = {"OC": LAW_OC, "target": "law", "query": str(query), "type": "JSON"}
-        r = httpx.get(url, params=params, timeout=6.0)
+        r = httpx.get(url, params=params, timeout=timeout)
+        text = r.text
         if r.status_code != 200:
-            return []
-        data = r.json()
-        names = []
+            return None, f"HTTP {r.status_code}: {text[:500]}"
+        try:
+            return r.json(), ""
+        except Exception:
+            return None, f"JSON 파싱 실패: {text[:800]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)}"
 
-        def walk(obj):
-            try:
-                if isinstance(obj, dict):
-                    nm = obj.get("법령명한글") or obj.get("법령명")
-                    if nm:
-                        names.append(str(nm).strip())
-                    for v in obj.values():
-                        walk(v)
-                elif isinstance(obj, list):
-                    for v in obj:
-                        walk(v)
-            except Exception:
-                return
 
-        walk(data)
-        seen, uniq = set(), []
-        for n in names:
-            if n and n not in seen:
-                seen.add(n)
-                uniq.append(n)
-        return uniq[:topk]
-    except Exception:
-        return []
+def _walk_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_dicts(v)
 
+
+def _first_value(d: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def search_law_candidates(query: str, topk: int = 5) -> List[Dict[str, str]]:
+    """법령명 검색. MST/법령ID까지 확보한다."""
+    if not LAW_OC:
+        return _law_debug_msg("LAW_GO_KR_OC 환경변수가 비어 있습니다.")
+    params = {"OC": LAW_OC, "target": "law", "type": "JSON", "query": str(query)}
+    data, err = _http_get_json("https://www.law.go.kr/DRF/lawSearch.do", params)
+    if err:
+        return _law_debug_msg(err)
+
+    candidates: List[Dict[str, str]] = []
+    for d in _walk_dicts(data):
+        name = _first_value(d, ["법령명한글", "법령명", "법령명한글명", "lawName"])
+        mst = _first_value(d, ["MST", "법령일련번호", "mst"])
+        law_id = _first_value(d, ["법령ID", "lawId", "ID"])
+        promulgation = _first_value(d, ["공포일자", "promulgationDate"])
+        enforcement = _first_value(d, ["시행일자", "enforcementDate"])
+        ministry = _first_value(d, ["소관부처명", "소관부처", "ministry"])
+        if name:
+            candidates.append({
+                "law_name": name,
+                "mst": mst,
+                "law_id": law_id,
+                "promulgation_date": promulgation,
+                "enforcement_date": enforcement,
+                "ministry": ministry,
+            })
+    seen, uniq = set(), []
+    for c in candidates:
+        key = (c.get("law_name"), c.get("mst"), c.get("law_id"))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq[:topk]
+
+
+def get_law_detail(mst: str = "", law_id: str = "") -> Tuple[Optional[Any], str]:
+    """법령 본문 JSON 조회."""
+    if not LAW_OC:
+        return None, "LAW_GO_KR_OC 환경변수가 비어 있습니다."
+    params: Dict[str, Any] = {"OC": LAW_OC, "target": "law", "type": "JSON"}
+    if mst:
+        params["MST"] = mst
+    elif law_id:
+        params["ID"] = law_id
+    else:
+        return None, "MST 또는 법령ID가 없습니다."
+    return _http_get_json("https://www.law.go.kr/DRF/lawService.do", params, timeout=9.0)
+
+
+def _extract_articles(law_json: Any) -> List[Dict[str, str]]:
+    articles: List[Dict[str, str]] = []
+    for d in _walk_dicts(law_json):
+        # 법제처 조문 키 변형 대응
+        content = _first_value(d, ["조문내용", "조문내용문", "내용", "articleContent"])
+        title = _first_value(d, ["조문제목", "제목", "articleTitle"])
+        number = _first_value(d, ["조문번호", "조번호", "articleNo"])
+        branch = _first_value(d, ["조문가지번호", "가지번호"])
+        if content or title:
+            no = number + (("의" + branch) if branch and branch != "0" else "")
+            articles.append({"article_no": no, "title": title, "content": _normalize_text(content)})
+    # 중복 제거
+    seen, uniq = set(), []
+    for a in articles:
+        key = (a.get("article_no"), a.get("title"), a.get("content")[:80])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(a)
+    return uniq
+
+
+def _score_article(article: Dict[str, str], terms: List[str]) -> float:
+    hay = " ".join([article.get("article_no", ""), article.get("title", ""), article.get("content", "")])
+    score = 0.0
+    for t in terms:
+        if t in hay:
+            score += 3.0
+        for g in _ngrams(t, 2):
+            if g and g in hay:
+                score += 0.4
+    return score
+
+
+def search_law_articles(query: str, law_name: str = "", topk: int = 3) -> List[Dict[str, str]]:
+    """법령명 후보를 찾고, 첫 후보의 본문에서 관련 조문을 검색한다."""
+    search_query = law_name or _guess_law_query(query)
+    candidates = search_law_candidates(search_query, topk=4)
+    if not candidates or candidates[0].get("law_name") == "[디버그]":
+        return candidates
+
+    results: List[Dict[str, str]] = []
+    terms = _expanded_terms(query)
+    for cand in candidates:
+        data, err = get_law_detail(cand.get("mst", ""), cand.get("law_id", ""))
+        if err:
+            if LAW_DEBUG:
+                results.append({"law_name": cand.get("law_name", ""), "article": "[본문조회 오류]", "content": err})
+            continue
+        articles = _extract_articles(data)
+        scored = sorted((( _score_article(a, terms), a) for a in articles), key=lambda x: -x[0])
+        picked = [a for score, a in scored if score > 0][:topk]
+        if not picked and articles:
+            picked = articles[:1]
+        for a in picked:
+            results.append({
+                "law_name": cand.get("law_name", ""),
+                "mst": cand.get("mst", ""),
+                "law_id": cand.get("law_id", ""),
+                "article_no": a.get("article_no", ""),
+                "title": a.get("title", ""),
+                "content": a.get("content", "")[:1000],
+            })
+        if results:
+            break
+    return results[:topk]
+
+
+def _guess_law_query(query: str) -> str:
+    q = str(query)
+    if any(k in q for k in ["재무", "회계", "예산", "결산", "계정", "지출"]):
+        return "사회복지법인 및 사회복지시설 재무ㆍ회계 규칙"
+    if any(k in q for k in ["개인정보", "동의", "사진", "영상"]):
+        return "개인정보 보호법"
+    if any(k in q for k in ["감염병", "수족구", "등원중지", "전염"]):
+        return "감염병의 예방 및 관리에 관한 법률"
+    if any(k in q for k in ["아동학대", "보호", "안전사고"]):
+        return "아동복지법"
+    if "시행규칙" in q or "별표" in q or "배치" in q or "정원" in q:
+        return "영유아보육법 시행규칙"
+    return "영유아보육법"
+
+
+def _format_law_article(a: Dict[str, str], idx: int) -> str:
+    title = f" {a.get('title')}" if a.get("title") else ""
+    article = f"제{a.get('article_no')}조{title}" if a.get("article_no") else (a.get("title") or "관련 조문")
+    return f"{idx}. {a.get('law_name', '법령')} {article}\n   {a.get('content', '')}"
 
 # ──────────────────────────────────────────────────────────────
-# Tool 1. 지침·법령 근거 조회  ★핵심
+# 4. MCP Tools
 # ──────────────────────────────────────────────────────────────
 @mcp.tool()
-def search_law_and_guidelines(질의: str) -> str:
-    """어린이집 행정 질문에 실제 지침서·법령에서 근거를 찾아 즉시 답합니다.
-
-    [트리거] "근거", "법령", "법", "조항", "지침", "보육사업안내", "재무회계",
-            "표준보육과정", "누리과정", "운영위원회", "교사 비율", "예산", "보조금",
-            "이거 맞아?", "어떻게 해야 해?", "규정"
-    [용도] AI 추측이 아니라 실제 지침서 원문(보육사업안내·재무회계 매뉴얼·표준보육과정·
-          누리과정)과 법제처 관련 법령명을 근거로 제공합니다. 호스트 AI는 이 근거로
-          해결책을 작성하고 출처(지침서명/법령명)를 반드시 함께 안내하세요. 근거에 없는
-          내용은 단정하지 마세요.
-          ★검색 팁: 질의는 문장 전체보다 '핵심 명사' 위주가 정확합니다
-          (예: '운영위원회 보호자 비율', '교재교구비 집행 기준'). 원하는 근거가 안 보이면
-          핵심어를 바꿔 한 번 더 호출하세요.
+def search_childcare_basis(질의: str, 자료분류: str = "", 법령명: str = "") -> str:
+    """보육사업안내·평가제·재무회계·표준보육과정·누리과정·법령 근거를 함께 찾습니다.
 
     Args:
-        질의: 알고 싶은 핵심어 (예: "운영위원회 보호자 비율", "예산 편성 절차", "표준보육과정 5개 영역")
+        질의: 찾고 싶은 현장 질문 또는 핵심어. 예: 운영위원회 보호자 비율, 원장 겸임, 건강검진 미수검
+        자료분류: 선택. 보육사업안내/재무회계/평가매뉴얼/표준보육과정/누리과정 등으로 좁힐 때 사용
+        법령명: 선택. 영유아보육법 시행규칙처럼 특정 법령을 지정할 때 사용
     """
     try:
-        parts = []
-        hits = _search_guidelines(질의, topk=6)
+        parts = [f"[보육나침반 근거검색] {질의}"]
+        hits = search_guidelines(질의, topk=5, category_hint=자료분류)
         if hits:
-            parts.append("[지침서 근거]")
-            for h in hits:
-                parts.append("\n▷ 출처: " + h["source"] + "\n" + h["text"])
+            parts.append("\n[공식 발간자료 근거]")
+            for i, h in enumerate(hits, 1):
+                parts.append(_format_guideline_hit(h, i))
         else:
-            parts.append("[지침서] 관련 내용을 못 찾았어요. 키워드를 조금 더 구체적으로 적어보세요.")
+            parts.append("\n[공식 발간자료 근거]\n색인된 자료에서 직접 근거를 찾지 못했습니다. 자료 색인 파일에 해당 PDF가 포함되어 있는지 확인하세요.")
 
-        law_names = _fetch_law_names(질의)
-        if law_names:
-            parts.append("\n\n[관련 법령 (법제처 국가법령정보)]")
-            for n in law_names:
-                parts.append("- " + n)
-            parts.append("(법령 원문 출처: 법제처)")
+        law_articles = search_law_articles(질의, law_name=법령명, topk=3)
+        if law_articles:
+            parts.append("\n[법령 근거 — 법제처 국가법령정보 API]")
+            for i, a in enumerate(law_articles, 1):
+                if a.get("law_name") == "[디버그]":
+                    parts.append(a.get("message", "법령 디버그 메시지 없음"))
+                else:
+                    parts.append(_format_law_article(a, i))
+        else:
+            parts.append("\n[법령 근거]\n관련 조문을 찾지 못했습니다. 법령명을 지정하거나 핵심어를 바꿔 다시 조회하세요.")
 
         parts.append(
-            "\n\n※ 호스트 AI: 위 근거로 단계별 해결책을 제시하고 출처를 함께 표기하세요. "
-            "근거에 없는 내용은 단정하지 말고 확인 방법을 안내하세요."
+            "\n[현장 적용 원칙]\n"
+            "1. 위 근거를 바탕으로 요약하되, 근거에 없는 내용은 단정하지 않습니다.\n"
+            "2. 최종 제출·신고·회계 판단은 기관 상황과 지자체 안내를 함께 확인합니다.\n"
+            "3. 공문·체크리스트가 필요하면 create_official_document 또는 make_childcare_admin_checklist를 함께 사용합니다."
         )
         return "\n".join(parts)
-    except Exception:
-        return "조회 중 일시적 문제가 있었어요. 질의를 조금 바꿔 다시 시도해 주세요."
+    except Exception as e:
+        return f"근거검색 중 문제가 발생했습니다. 질의를 줄여 다시 시도하세요. ({type(e).__name__})"
 
 
-# ──────────────────────────────────────────────────────────────
-# Tool 2. 회계 집행 검증  ★검증 중심 핵심
-# ──────────────────────────────────────────────────────────────
-# 어린이집 세출(지출) 예산 과목 구분 — 2025 재무회계 매뉴얼 CHAPTER Ⅲ 전체(관-항-목)
+# 기존 이름 호환용
+@mcp.tool()
+def search_law_and_guidelines(질의: str) -> str:
+    """기존 호환용 도구명. 내부적으로 search_childcare_basis를 호출합니다."""
+    return search_childcare_basis(질의)
+
+
+@mcp.tool()
+def search_law_only(질의: str, 법령명: str = "") -> str:
+    """법제처 API만 사용해 관련 법령명과 조문을 조회합니다."""
+    try:
+        parts = [f"[법제처 법령조회] {질의}"]
+        candidates = search_law_candidates(법령명 or _guess_law_query(질의), topk=5)
+        if candidates:
+            parts.append("\n[법령 후보]")
+            for c in candidates:
+                if c.get("law_name") == "[디버그]":
+                    parts.append(c.get("message", ""))
+                else:
+                    parts.append(f"- {c.get('law_name')} / MST={c.get('mst')} / 법령ID={c.get('law_id')} / 시행일자={c.get('enforcement_date')}")
+        articles = search_law_articles(질의, law_name=법령명, topk=5)
+        if articles:
+            parts.append("\n[관련 조문]")
+            for i, a in enumerate(articles, 1):
+                parts.append(_format_law_article(a, i))
+        else:
+            parts.append("\n관련 조문을 찾지 못했습니다. LAW_DEBUG=true로 원인을 확인하거나 법령명을 직접 지정하세요.")
+        return "\n".join(parts)
+    except Exception as e:
+        return f"법령 조회 중 문제가 발생했습니다. ({type(e).__name__})"
+
+
 ACCOUNT_TABLE = (
-    "[어린이집 세출(지출) 예산 과목 구분 — 관(款)·항(項)·목(目)]\n"
-    "■ 인건비(100관)\n"
-    "  · 원장인건비(110항): 원장급여(111목) / 원장수당(112목)\n"
-    "  · 보육교직원인건비(120항): 보육교직원급여(121목) / 보육교직원수당(122목)\n"
-    "  · 기타인건비(130항): 기타인건비(131목)\n"
-    "  · 기관부담금(140항): 법정부담금(141목) / 퇴직금및퇴직적립금(142목)\n"
-    "■ 운영비(200관)\n"
-    "  · 관리운영비(210항): 수용비및수수료(211목) / 공공요금및제세공과금(212목) / 연료비(213목) / "
-    "여비(214목) / 차량비(215목) / 복리후생비(216목) / 기타운영비(217목)\n"
-    "  · 업무추진비(220항): 업무추진비(221목) / 직책급(222목) / 회의비(223목)\n"
-    "■ 보육활동비(300관)\n"
-    "  · 기본보육활동비(310항): 교직원연수·연구비(311목) / 교재·교구구입비(312목) / 행사비(313목) / "
-    "영유아복리비(314목) / 급식·간식재료비(315목)\n"
-    "■ 수익자부담경비(400관)\n"
-    "  · 선택적보육활동비(410항): 특별활동비지출(411목)\n"
-    "  · 기타필요경비(420항): 기타필요경비지출(421목)\n"
-    "■ 적립금(500관): 적립금(510항)>적립금(511목)\n"
-    "■ 상환·반환금(600관)\n"
-    "  · 차입금상환(610항): 단기차입금상환(611목) / 장기차입금상환(612목)\n"
-    "  · 반환금(620항): 보조금반환금(621목) / 보호자반환금(622목) / 법인회계전출금(623목)\n"
-    "■ 재산조성비(700관)\n"
-    "  · 시설비(710항): 시설비(711목) / 시설장비유지비(712목)\n"
-    "  · 자산구입비(720항): 자산취득비(721목)\n"
-    "■ 과년도지출(800관): 과년도지출(811목)  ■ 잡지출(900관): 잡지출(911목)  "
-    "■ 예비비(1000관): 예비비(1011목)\n"
-    "※ 참고: 회의비(223목)는 업무추진비(220항) 아래의 목이며, 매뉴얼 예시에 운영위원회·학부모회의·"
-    "교사회의가 회의비로 명시됨(매뉴얼 p.71). 직책급(222목)은 원장 직책수당."
+    "[어린이집 세출 예산 과목 구분]\n"
+    "■ 인건비(100관): 원장인건비(110항), 보육교직원인건비(120항), 기타인건비(130항), 기관부담금(140항)\n"
+    "■ 운영비(200관): 관리운영비(210항: 수용비및수수료·공공요금·연료비·여비·차량비·복리후생비·기타운영비), "
+    "업무추진비(220항: 업무추진비·직책급·회의비)\n"
+    "■ 보육활동비(300관): 기본보육활동비(310항: 교직원연수연구비·교재교구구입비·행사비·영유아복리비·급식간식재료비)\n"
+    "■ 수익자부담경비(400관): 특별활동비지출, 기타필요경비지출\n"
+    "■ 적립금(500관), 상환·반환금(600관), 재산조성비(700관), 과년도지출(800관), 잡지출(900관), 예비비(1000관)"
 )
 
 
 @mcp.tool()
 def verify_accounting(지출내용: str, 계정과목: str = "", 비고: str = "") -> str:
-    """어린이집 회계 집행의 적정성을 재무회계 매뉴얼의 '관-항-목' 근거로 검증하도록 돕습니다.
-
-    [트리거] "회계 검증", "이 계정 맞아?", "계정과목", "어느 과목", "집행", "집행률",
-            "예산 위반", "행정처분", "이 비용 처리", "목적외 사용", "관 항 목"
-    [용도] 어떤 지출을 어느 '관-항-목'에 집행하는 게 맞는지, 집행이 적정한지, 위반/행정처분
-          사항인지 판단할 근거(재무회계 규정 원문 + 전체 과목 구분표)를 제공합니다.
-
-    호스트 AI 필수 규칙:
-      - 계정과목은 반드시 '관 > 항 > 목' 3단계를 모두 표기. (예: 운영비(200관) > 업무추진비(220항)
-        > 회의비(223목)) 한 단계라도 생략 금지.
-      - 매뉴얼 근거 원문과 산출기초 예시·관련근거 페이지를 함께 인용.
-      - 근거에서 확정되지 않으면 단정하지 말고 '추가확인 필요'로 안내.
-
-    Args:
-        지출내용: 검증할 지출/물품 (예: "교사회의비", "교재교구 구입", "원장 직책수당")
-        계정과목: 집행하려는(또는 집행한) 계정과목 (예: "운영비", "회의비")
-        비고: 추가 상황 (예: "예산 80% 집행 상태")
-    """
+    """어린이집 재무회계 지출의 계정과목·증빙·주의사항을 점검합니다."""
     try:
-        q = " ".join([x for x in [지출내용, 계정과목, 비고] if x]).strip() or str(지출내용)
-        hits = _search_guidelines(q, topk=4, source_keyword="재무회계")
-        if not hits:
-            hits = _search_guidelines(q, topk=3)
-        head = "[회계 집행 검증]  지출: " + str(지출내용)
+        q = " ".join([지출내용, 계정과목, 비고, "재무 회계 지출 계정 증빙"]).strip()
+        hits = search_guidelines(q, topk=4, category_hint="재무회계")
+        laws = search_law_articles(q, law_name="사회복지법인 및 사회복지시설 재무ㆍ회계 규칙", topk=2)
+        parts = [f"[재무회계 검토] 지출내용: {지출내용}"]
         if 계정과목:
-            head += "  /  계정과목(안): " + str(계정과목)
-        parts = [head]
+            parts.append(f"계정과목(안): {계정과목}")
+        if 비고:
+            parts.append(f"추가상황: {비고}")
+        parts.append("\n[검토 기준]")
+        parts.append(ACCOUNT_TABLE)
         if hits:
-            parts.append("\n[매뉴얼 근거 — 해당 과목 원문]")
-            for h in hits:
-                parts.append("\n▷ 출처: " + h["source"] + "\n" + h["text"])
-        else:
-            parts.append("\n관련 규정을 못 찾았어요. 지출내용을 더 구체적으로 적어보세요.")
-        parts.append("\n\n" + ACCOUNT_TABLE)
+            parts.append("\n[재무회계 매뉴얼 근거]")
+            for i, h in enumerate(hits, 1):
+                parts.append(_format_guideline_hit(h, i))
+        if laws:
+            parts.append("\n[관련 법령]")
+            for i, a in enumerate(laws, 1):
+                parts.append(_format_law_article(a, i))
         parts.append(
-            "\n[검증 포인트 — 호스트 AI가 위 근거로 판단]\n"
-            "1. 계정과목 적정성: 지출 성격에 맞는 '관 > 항 > 목'을 위 표에서 정확히 찾아 3단계 모두 표기\n"
-            "2. 집행률: 예산 대비 집행률이 적정한지(과다·과소·목적외 여부)\n"
-            "3. 위반·행정처분: 목적외 사용·부적정 집행이면 영유아보육법(제38조의2 목적외 사용금지 등)·"
-            "사회복지시설 재무회계규칙상 시정명령·반환·행정처분 대상일 수 있음 → search_law_and_guidelines로 확인\n"
-            "※ 확정 곤란 시 '추가확인 필요' + 확인 방법 안내. 단정 금지."
+            "\n[현장 확인 체크]\n"
+            "□ 지출 성격에 맞는 관>항>목 3단계로 표기했는가\n"
+            "□ 예산 편성 항목과 집행 항목이 일치하는가\n"
+            "□ 세금계산서·카드전표·견적서·거래명세서 등 증빙이 있는가\n"
+            "□ 보조금·필요경비·수익자부담경비 목적 외 사용 소지가 없는가\n"
+            "□ 판단이 애매하면 지자체 또는 회계 담당자 확인 기록을 남겼는가"
         )
         return "\n".join(parts)
-    except Exception:
-        return "검증 중 일시적 문제가 있었어요. 지출내용을 조금 바꿔 다시 시도해 주세요."
+    except Exception as e:
+        return f"회계 검토 중 문제가 발생했습니다. ({type(e).__name__})"
 
 
-# ──────────────────────────────────────────────────────────────
-# Tool 3. 공식문서 작성
-# ──────────────────────────────────────────────────────────────
 @mcp.tool()
 def create_official_document(
     문서종류: str,
@@ -365,192 +625,205 @@ def create_official_document(
     원장명: str = "○○○",
     대상: str = "",
     날짜: str = "",
+    근거질의: str = "",
 ) -> str:
-    """어린이집 공식문서(공문)의 서식 구조에 맞춘 초안을 생성합니다.
-
-    [트리거] "가정통신문", "공지", "공문", "회의록", "인계인수서", "안내문 써줘", "문서 작성"
-    [용도] 정확한 서식 골격에 핵심내용을 채워 초안을 돌려줍니다. 호스트 AI가 따뜻하고
-          신뢰감 있는 문체로 다듬으세요.
-
-    Args:
-        문서종류: 가정통신문 | 공지사항 | 운영위원회회의록 | 직원회의록 | 협조공문 | 사무인계인수서
-        제목: 문서 제목/주제
-        핵심내용: 전달할 핵심 내용
-        어린이집명: 발신 기관명
-        원장명: 발신자(원장) 성명
-        대상: 수신 대상
-        날짜: 문서 일자 (미입력 시 오늘)
-    """
+    """어린이집 공문·협조요청서·안내문·회의록 초안을 생성합니다."""
     try:
-        d = 날짜 or 오늘
-        종류 = str(문서종류).replace(" ", "")
-        if 종류 in ("가정통신문", "안내문"):
-            대상 = 대상 or "학부모님"
-            return ("[가정통신문]  " + str(제목) + "\n\n" + str(어린이집명) + "\n\n존경하는 " + 대상 + "께,\n\n"
-                    + str(핵심내용) + "\n\n위 내용을 안내드리오니 협조 부탁드립니다.\n"
-                    "문의사항은 언제든지 원으로 연락 주시기 바랍니다.\n\n" + d + "\n" + str(어린이집명) + " 원장 " + str(원장명)
-                    + "\n\n※ 작성가이드: ①인사말 ②안내배경 ③구체일정·준비물 ④협조요청 ⑤문의처. 따뜻한 문체로 다듬을 것.")
-        if 종류 in ("공지사항", "공지"):
-            대상 = 대상 or "교직원"
-            return ("[공지]  " + str(제목) + "\n\n수신: " + 대상 + "\n일자: " + d + "\n\n" + str(핵심내용)
-                    + "\n\n위와 같이 공지하오니 숙지하여 주시기 바랍니다.\n\n" + str(어린이집명))
-        if 종류 in ("운영위원회회의록", "운영위원회"):
-            return ("[" + str(어린이집명) + " 운영위원회 회의록]\n\n1. 일시: " + d + "\n2. 장소:\n"
-                    "3. 참석: (위원 ○명 중 ○명 — 보호자위원/교직원위원/지역위원)\n4. 안건:\n   " + str(핵심내용)
-                    + "\n5. 논의 및 결정사항:\n   가.\n   나.\n6. 기타:\n7. 차기 회의:\n\n작성자:            확인(원장): "
-                    + str(원장명) + "\n\n※ 운영위 구성·정족수·주기는 search_law_and_guidelines로 근거 확인 후 안내.")
-        if 종류 in ("직원회의록", "직원회의"):
-            return ("[" + str(어린이집명) + " 직원회의록]\n\n1. 일시: " + d + "\n2. 참석:\n3. 안건:\n   "
-                    + str(핵심내용) + "\n4. 협의내용:\n5. 결정 및 업무분장:\n6. 전달사항:\n\n작성자:            결재(원장): "
-                    + str(원장명))
-        if 종류 in ("협조공문", "공문"):
-            대상 = 대상 or "관계기관"
-            return (str(어린이집명) + "\n\n수신: " + 대상 + "\n제목: " + str(제목)
-                    + "\n\n1. 귀 기관의 무궁한 발전을 기원합니다.\n2. " + str(핵심내용)
-                    + "\n3. 협조하여 주시기 바랍니다.\n\n붙임:  1.\n\n" + d + "\n" + str(어린이집명) + " 원장 " + str(원장명) + "  (직인)")
-        if 종류 == "사무인계인수서":
-            return ("[사무인계인수서]\n\n1. 인계자:                    2. 인수자:\n3. 인계인수 일자: " + d
-                    + "\n4. 직위/담당업무:\n5. 인계인수 내역:\n   " + str(핵심내용)
-                    + "\n   - 진행 중 업무:\n   - 보관 문서·물품:\n   - 인장·통장·열쇠 등:\n6. 특이사항:\n\n"
-                    "인계자(서명):            인수자(서명):\n입회/원장 " + str(원장명) + "(서명):")
-        return ("'" + str(문서종류) + "'는 등록된 서식이 없어요. 지원: 가정통신문/공지사항/운영위원회회의록/"
-                "직원회의록/협조공문/사무인계인수서.")
-    except Exception:
-        return "문서 생성 중 일시적 문제가 있었어요. 입력을 확인해 다시 시도해 주세요."
+        d = 날짜 or TODAY
+        kind = str(문서종류).replace(" ", "")
+        basis = ""
+        if 근거질의:
+            basis = "\n\n[작성 참고 근거]\n" + search_childcare_basis(근거질의)[:1800]
+
+        if kind in {"협조공문", "공문", "자료요청", "자료제출요청"}:
+            target = 대상 or "관계기관"
+            return (
+                f"[협조공문 초안]\n\n문서번호: {어린이집명}-2026-00\n시행일자: {d}\n수    신: {target}\n발    신: {어린이집명}\n제    목: {제목}\n\n"
+                f"1. 귀 기관의 협조에 감사드립니다.\n\n"
+                f"2. {핵심내용}\n\n"
+                f"3. 관련 자료는 어린이집 운영 및 행정 확인을 위한 자료로 활용될 예정이오니 협조하여 주시기 바랍니다.\n\n"
+                f"붙임: 필요 시 기재.  끝.\n\n{어린이집명} 원장 {원장명}"
+                f"{basis}"
+            )
+        if kind in {"가정통신문", "안내문", "보호자안내"}:
+            target = 대상 or "학부모님"
+            return (
+                f"[가정통신문 초안]\n\n제목: {제목}\n\n{target}께\n\n"
+                f"{핵심내용}\n\n"
+                f"가정에서도 함께 확인해 주시기 바라며, 문의사항은 어린이집으로 연락해 주시기 바랍니다.\n\n"
+                f"{d}\n{어린이집명} 원장 {원장명}{basis}"
+            )
+        if kind in {"공지", "공지사항", "교직원공지"}:
+            target = 대상 or "교직원"
+            return f"[공지 초안]\n\n수신: {target}\n일자: {d}\n제목: {제목}\n\n{핵심내용}\n\n위 내용을 확인하여 업무에 반영해 주시기 바랍니다.\n\n{어린이집명}{basis}"
+        if kind in {"운영위원회회의록", "운영위원회"}:
+            return (
+                f"[{어린이집명} 운영위원회 회의록 초안]\n\n1. 일시: {d}\n2. 장소:\n3. 참석자:\n4. 안건: {제목}\n5. 논의내용:\n   {핵심내용}\n6. 결정사항:\n7. 기타사항:\n\n작성자:        확인: 원장 {원장명}{basis}"
+            )
+        return "지원 문서종류: 협조공문/자료요청/가정통신문/공지사항/운영위원회회의록 입니다."
+    except Exception as e:
+        return f"문서 생성 중 문제가 발생했습니다. ({type(e).__name__})"
 
 
-# ──────────────────────────────────────────────────────────────
-# Tool 4. 공식문서 검토
-# ──────────────────────────────────────────────────────────────
-필수항목 = {
-    "가정통신문": ["제목", "인사말", "안내 배경/목적", "구체 일정·날짜", "준비물/협조사항", "문의처", "발신일자", "어린이집명·원장명"],
-    "운영위원회회의록": ["일시", "장소", "참석자(정족수)", "안건", "논의·결정사항", "작성자/확인자"],
-    "직원회의록": ["일시", "참석자", "안건", "협의내용", "결정·업무분장", "전달사항"],
-    "협조공문": ["수신처", "제목", "본문(요청사항)", "붙임", "발신일자", "기관명·직인"],
+@mcp.tool()
+def make_childcare_admin_checklist(업무상황: str, 자료분류: str = "", 마감일: str = "") -> str:
+    """현장 상황에 맞는 행정 체크리스트와 필요 문서를 생성합니다."""
+    try:
+        basis = search_childcare_basis(업무상황, 자료분류=자료분류)[:2200]
+        due = f"\n마감/기한: {마감일}" if 마감일 else ""
+        return (
+            f"[보육행정 체크리스트] {업무상황}{due}\n\n"
+            "1. 상황 확인\n□ 대상 아동·교직원·기관 범위를 확인한다.\n□ 관련 법령·지침·평가제 기준을 확인한다.\n□ 지자체 또는 관계기관 확인이 필요한 항목을 구분한다.\n\n"
+            "2. 문서·자료 준비\n□ 공문 또는 안내문 초안을 작성한다.\n□ 보호자 안내가 필요한 경우 안내 일자와 방법을 기록한다.\n□ 회계·안전·건강 관련 증빙자료를 보관한다.\n\n"
+            "3. 실행 및 기록\n□ 담당자와 처리기한을 정한다.\n□ 처리 결과와 회신 여부를 기록한다.\n□ 추후 평가제·운영점검에서 확인 가능한 형태로 보관한다.\n\n"
+            "4. 재점검\n□ 누락 서류가 없는지 확인한다.\n□ 민원 소지가 있는 표현은 사실 중심으로 수정한다.\n□ 최종 제출 전 원장 또는 담당자가 확인한다.\n\n"
+            f"[관련 근거 요약]\n{basis}"
+        )
+    except Exception as e:
+        return f"체크리스트 생성 중 문제가 발생했습니다. ({type(e).__name__})"
+
+
+REQUIRED_FIELDS = {
+    "가정통신문": ["제목", "안내 목적", "구체 일정", "협조사항", "문의처", "발신일자", "어린이집명"],
+    "협조공문": ["수신처", "제목", "요청사항", "제출기한", "붙임", "발신일자", "기관명"],
+    "운영위원회회의록": ["일시", "장소", "참석자", "안건", "논의내용", "결정사항", "작성자/확인자"],
+    "공지사항": ["제목", "대상", "핵심내용", "기한", "담당자", "발신일자"],
+}
+
+RISKY_PHRASES = {
+    "어쩔 수 없습니다": "현재 상황을 확인하고 필요한 조치를 진행하겠습니다",
+    "책임질 수 없습니다": "기관에서 확인 가능한 범위 내에서 절차에 따라 안내드리겠습니다",
+    "아이들이 그럴 수 있습니다": "영유아의 발달 특성을 고려하되, 재발 방지를 위해 세심히 지원하겠습니다",
+    "무조건": "관련 기준과 상황을 확인한 후",
+    "절대": "가능한 범위에서",
 }
 
 
 @mcp.tool()
 def review_admin_document(문서내용: str, 문서종류: str = "가정통신문") -> str:
-    """작성한 어린이집 문서를 검토해 빠진 필수 항목과 보완점을 알려줍니다.
-
-    [트리거] "검토", "확인해줘", "빠진 거 없어?", "이거 괜찮아?", "점검"
-    [용도] 문서에 서식상 필수 항목이 빠지지 않았는지 점검합니다. 호스트 AI는 결과를
-          친절하게 정리해 안내하세요.
-
-    Args:
-        문서내용: 검토할 문서 전문
-        문서종류: 가정통신문 | 운영위원회회의록 | 직원회의록 | 협조공문
-    """
+    """공문·공지·안내문의 누락 항목과 민원 소지 표현을 점검합니다."""
     try:
-        종류 = str(문서종류).replace(" ", "")
-        items = 필수항목.get(종류)
-        if not items:
-            return "'" + str(문서종류) + "' 검토 기준이 아직 없어요. 지원: " + " / ".join(필수항목.keys())
+        kind = 문서종류.replace(" ", "")
+        fields = REQUIRED_FIELDS.get(kind) or REQUIRED_FIELDS.get("가정통신문", [])
         text = str(문서내용)
-        checks = {
-            "발신일자": bool(re.search(r"\d{4}[.\-/년]", text)),
-            "구체 일정·날짜": bool(re.search(r"\d{1,2}\s*월|\d{1,2}\s*일|\d{4}[.\-/]", text)),
-            "문의처": ("문의" in text or "연락" in text),
-            "인사말": ("안녕" in text or "존경" in text or "사랑" in text),
-        }
         found, missing = [], []
-        for it in items:
-            ok = checks.get(it)
-            if ok is None:
-                ok = any(k in text for k in re.findall(r"[가-힣]+", it))
-            (found if ok else missing).append(it)
-        return ("[" + str(문서종류) + " 검토 결과]\n\n✅ 포함됨: " + (", ".join(found) if found else "없음")
-                + "\n\n⚠️ 빠졌을 수 있음: " + (", ".join(missing) if missing else "없음 (필수 항목 모두 포함)")
-                + "\n\n※ 호스트 AI: 빠진 항목을 친절히 짚고 보완 방법을 제안하세요.")
-    except Exception:
-        return "검토 중 일시적 문제가 있었어요. 다시 시도해 주세요."
+        for f in fields:
+            if any(tok in text for tok in _tokenize(f)):
+                found.append(f)
+            else:
+                missing.append(f)
+        risks = []
+        for bad, good in RISKY_PHRASES.items():
+            if bad in text:
+                risks.append(f"- '{bad}' → '{good}'")
+        return (
+            f"[{문서종류} 문서점검]\n\n"
+            f"✅ 포함된 항목: {', '.join(found) if found else '확인된 항목 없음'}\n"
+            f"⚠️ 보완할 항목: {', '.join(missing) if missing else '필수 항목 대체로 포함'}\n\n"
+            f"[표현 점검]\n{chr(10).join(risks) if risks else '큰 민원 소지 표현은 확인되지 않았습니다.'}\n\n"
+            "[보완 원칙]\n□ 사실 중심으로 작성\n□ 기한·대상·협조사항 명확화\n□ 기관 조치사항과 보호자 협조사항 분리\n□ 최종 제출 전 근거 확인"
+        )
+    except Exception as e:
+        return f"문서 점검 중 문제가 발생했습니다. ({type(e).__name__})"
 
 
-# ──────────────────────────────────────────────────────────────
-# Tool 5. 행정 절차 안내
-# ──────────────────────────────────────────────────────────────
-절차_DB = {
-    "운영위원회 구성": {
-        "단계": ["위원 구성(보호자·교직원·지역위원)", "위원 위촉 및 명단 정리",
-                "정기회의 개최(분기별 1회 이상 권장)", "회의록 작성·보관 및 결과 안내"],
-        "서류": ["위원 명단", "위촉 문서", "회의록"],
-        "근거확인": "구성·정족수·주기는 search_law_and_guidelines로 보육사업안내 최신본 확인",
-    },
-    "신규 교사 채용": {
-        "단계": ["채용 공고·접수", "자격(보육교사 자격증) 확인", "면접·선발",
-                "결격사유 확인(건강진단·성범죄경력·아동학대 조회)", "근로계약·4대보험 신고",
-                "보육통합정보시스템 인력 등록"],
-        "서류": ["자격증 사본", "건강진단 결과", "범죄경력 조회 동의/결과", "근로계약서"],
-        "근거확인": "결격사유 조회는 채용 전 필수. 최신 절차는 search_law_and_guidelines로 확인",
-    },
-}
+
+@mcp.tool()
+def map_play_to_curriculum(연령: str, 놀이상황: str, 관찰내용: str = "") -> str:
+    """0·1세/2세/3~5세 놀이를 5개 영역, 배움읽기, 교사지원, 다음 놀이로 연결합니다."""
+    try:
+        age = str(연령)
+        q = " ".join([age, 놀이상황, 관찰내용, "놀이 배움 읽기 5개 영역 교사 지원 상호작용 공간 자료 평가"]).strip()
+        if any(k in age for k in ["0", "1", "영아"]):
+            hint = "0·1세 실행자료"
+        elif "2" in age:
+            hint = "2세 실행자료"
+        elif any(k in age for k in ["3", "4", "5", "유아", "누리"]):
+            hint = "누리과정"
+        else:
+            hint = "표준보육과정"
+        hits = search_guidelines(q, topk=6, category_hint=hint)
+        basis = "\n".join(_format_guideline_hit(h, i) for i, h in enumerate(hits, 1)) if hits else "관련 실행자료 근거를 찾지 못했습니다. 연령과 놀이 단서를 더 구체화하세요."
+        return (
+            f"[놀이-보육과정 연결] 연령: {연령}\n\n"
+            f"놀이상황: {놀이상황}\n"
+            f"관찰내용: {관찰내용 or '별도 입력 없음'}\n\n"
+            "[배움 읽기 관점]\n"
+            "- 영유아가 무엇에 관심을 두었는지 봅니다.\n"
+            "- 몸짓, 표정, 말소리, 반복 행동, 또래와의 관계, 자료 탐색을 배움의 단서로 읽습니다.\n"
+            "- 결과물보다 놀이 과정과 변화에 주목합니다.\n\n"
+            "[5개 영역 연결 초안]\n"
+            "1. 신체운동·건강: 움직임, 감각, 소근육·대근육, 안전한 일상 경험을 확인합니다.\n"
+            "2. 의사소통: 말소리, 표정, 몸짓, 듣기·말하기·읽기·쓰기의 초기 경험을 확인합니다.\n"
+            "3. 사회관계: 교사·또래와의 관계, 자기표현, 공동 놀이, 갈등 조절 단서를 확인합니다.\n"
+            "4. 예술경험: 감각적 표현, 색·소리·움직임·재료 탐색, 창의적 표현을 확인합니다.\n"
+            "5. 자연탐구: 비교, 반복, 관찰, 예측, 원인 탐색, 자연물·사물 탐구를 확인합니다.\n\n"
+            "[교사의 놀이지원]\n"
+            "□ 영유아의 현재 흥미를 끊지 않고 관찰합니다.\n"
+            "□ 필요한 경우 짧은 언어적 지원, 공감, 질문, 자료 추가, 공간 조정으로 지원합니다.\n"
+            "□ 놀이를 억지로 확장하기보다 영유아의 신호에 따라 다음 환경을 준비합니다.\n\n"
+            f"[관련 실행자료 근거]\n{basis}"
+        )
+    except Exception as e:
+        return f"놀이-보육과정 연결 중 문제가 발생했습니다. ({type(e).__name__})"
+
+@mcp.tool()
+def answer_childcare_admin_case(질문: str, 기관유형: str = "", 아동연령월령: str = "", 추가상황: str = "") -> str:
+    """보육료·운영·회계·평가제·놀이 질문을 근거검색+조건분기 형태로 답합니다."""
+    try:
+        q = " ".join([질문, 기관유형, 아동연령월령, 추가상황]).strip()
+        # 우선 근거를 넓게 검색
+        basis = search_childcare_basis(q)[:3000]
+        flags = []
+        if any(k in q for k in ["보육일수", "11일", "보육료", "결제", "23개월", "월령"]):
+            flags.append("보육료·보육일수 질문은 월령, 입·퇴소일, 출석일수, 결석사유, 지원유형에 따라 예외가 달라질 수 있으므로 보육사업안내 본문·부록의 보육료 지원 기준을 함께 확인해야 합니다.")
+        if any(k in q for k in ["회식", "업무추진비", "회의비", "추경", "전용", "관항목", "관 항 목"]):
+            flags.append("재무회계 질문은 먼저 지출 목적을 확정한 뒤 관-항-목, 예산 편성 여부, 목적 외 사용 여부, 전용·추경 가능 여부, 증빙을 순서대로 확인해야 합니다.")
+        if any(k in q for k in ["놀이", "배움", "5개 영역", "표준보육", "누리"]):
+            flags.append("놀이 질문은 연령별 실행자료와 해설서를 기준으로 5개 영역, 배움 읽기, 교사의 상호작용·공간·자료 지원을 함께 확인해야 합니다.")
+        return (
+            f"[보육나침반 사례답변]\n질문: {질문}\n기관유형: {기관유형 or '미입력'}\n아동연령/월령: {아동연령월령 or '미입력'}\n추가상황: {추가상황 or '미입력'}\n\n"
+            "[먼저 확인할 조건]\n" + ("\n".join(f"- {x}" for x in flags) if flags else "- 질문의 대상, 연령, 기간, 비용 재원, 적용 지침 연도를 먼저 확인합니다.") + "\n\n"
+            "[근거 검색 결과]\n" + basis + "\n\n"
+            "[답변 작성 원칙]\n- 근거가 확인된 부분과 추가 확인이 필요한 부분을 분리합니다.\n- 예외 규정은 월령·기관유형·재원·기한 조건을 함께 표시합니다.\n- 회계는 관-항-목과 증빙자료를 함께 제시합니다."
+        )
+    except Exception as e:
+        return f"사례답변 생성 중 문제가 발생했습니다. ({type(e).__name__})"
 
 
 @mcp.tool()
 def guide_admin_procedure(업무: str) -> str:
-    """어린이집 행정 업무의 '절차 + 필요서류 + 근거확인 방법'을 단계별로 안내합니다.
-
-    [트리거] "절차", "어떻게 해야 해", "뭐부터", "필요한 서류", "채용 절차", "운영위 어떻게"
-    [용도] 무엇을 어떤 순서로 해야 하는지 알려줍니다.
-
-    Args:
-        업무: 안내받을 업무명 (예: "신규 교사 채용", "운영위원회 구성")
-    """
-    try:
-        매칭 = None
-        for key in 절차_DB:
-            if key in str(업무) or str(업무) in key or any(w in str(업무) for w in key.split()):
-                매칭 = key
-                break
-        if not 매칭:
-            return ("'" + str(업무) + "' 절차는 아직 등록 전이에요. 현재 등록: " + " / ".join(절차_DB.keys())
-                    + "\n(다른 업무는 search_law_and_guidelines로 지침에서 근거를 찾아볼 수 있어요.)")
-        p = 절차_DB[매칭]
-        단계 = "\n".join("  " + str(i) + ". " + s for i, s in enumerate(p["단계"], 1))
-        return ("[" + 매칭 + " — 행정 절차]\n\n▷ 진행 단계\n" + 단계 + "\n\n▷ 필요 서류: " + ", ".join(p["서류"])
-                + "\n▷ 근거 확인: " + p["근거확인"])
-    except Exception:
-        return "안내 중 일시적 문제가 있었어요. 다시 시도해 주세요."
-
-
-# ──────────────────────────────────────────────────────────────
-# Tool 6. 놀이흐름도 설계 (2024 개정 표준보육과정 5개 영역 기반)
-# ──────────────────────────────────────────────────────────────
-영역5 = "신체운동·건강 / 의사소통 / 사회관계 / 예술경험 / 자연탐구"
+    """보육행정 업무의 절차·필요서류·기록사항을 안내합니다."""
+    return make_childcare_admin_checklist(업무)
 
 
 @mcp.tool()
-def create_play_flow(놀이주제: str, 연령: str = "2세", 자료: str = "", 중심영역: str = "") -> str:
-    """놀이중심·비구조화 놀이 기반 '놀이흐름도'를 2024 개정 표준보육과정 틀로 설계합니다.
-
-    [트리거] "놀이흐름도", "놀이 설계", "놀이안", "흐름도 짜줘", "비구조화 놀이", "놀이 계획"
-    [용도] 놀이 관찰 → 배움읽기(5개 영역 연결) → 교사의 지원 → 다음 놀이 지원 흐름의
-          설계 프레임을 제공합니다. 호스트 AI가 연령·주제에 맞춰 구체화하세요.
-
-    Args:
-        놀이주제: 주제/소재 (예: "가을 낙엽", "상자")
-        연령: 대상 (예: "2세", "0-1세", "3-5세")
-        자료: 사용할 비정형 놀이자료(열린 자료)
-        중심영역: 강조할 표준보육과정 영역
-    """
+def check_index_status() -> str:
+    """현재 서버에 색인된 공식자료와 법제처 설정 상태를 점검합니다."""
     try:
-        자료줄 = ("제공 자료: " + str(자료) + "\n") if 자료 else "제공 자료: (비정형 놀이자료 / 영유아가 자유롭게 선택)\n"
-        영역줄 = ("중심 영역: " + str(중심영역) + "\n") if 중심영역 else ""
-        return (
-            "[놀이흐름도]  주제: " + str(놀이주제) + "  /  대상: " + str(연령) + "\n" + 자료줄 + 영역줄
-            + "표준보육과정 5개 영역: " + 영역5 + "\n\n"
-            "① 놀이 관찰 — 영유아가 무엇에 어떻게 몰입하는지 그대로 관찰 (개입·발문 최소화)\n"
-            "② 배움읽기 — 놀이 속 영유아의 배움을 5개 영역과 연결해 읽기 "
-            "(예: 자료를 쌓고 무너뜨림 → 자연탐구·신체운동·건강)\n"
-            "③ 교사의 지원 — 공간·자료·시간·상호작용으로 놀이를 지원 (지시가 아니라 지원)\n"
-            "④ 다음 놀이 지원 — 관찰·배움읽기를 토대로 내일의 놀이 환경·자료를 계획\n\n"
-            "※ 비구조화 놀이: 정해진 정답 흐름이 아니라 영유아가 주도하는 '가능성의 지도'. "
-            "호스트 AI는 " + str(연령) + "·" + str(놀이주제) + "에 맞춰 구체화하고, 영역 연계 근거는 "
-            "search_law_and_guidelines(표준보육과정)로 보강하세요."
-        )
-    except Exception:
-        return "설계 중 일시적 문제가 있었어요. 주제를 다시 입력해 주세요."
+        docs: Dict[str, int] = {}
+        cats: Dict[str, int] = {}
+        for c in GUIDELINE_INDEX:
+            docs[c.get("doc_title", "지침서")] = docs.get(c.get("doc_title", "지침서"), 0) + 1
+            cats[c.get("category", "기타")] = cats.get(c.get("category", "기타"), 0) + 1
+        parts = ["[보육나침반 색인 상태]"]
+        parts.append(f"총 색인 조각 수: {len(GUIDELINE_INDEX)}")
+        parts.append(f"법제처 OC 설정: {'있음' if LAW_OC else '없음'}")
+        parts.append(f"LAW_DEBUG: {LAW_DEBUG}")
+        parts.append("\n[문서별 조각 수]")
+        if docs:
+            for name, count in sorted(docs.items(), key=lambda x: -x[1])[:30]:
+                parts.append(f"- {name}: {count}개")
+        else:
+            parts.append("- 색인 파일을 찾지 못했습니다. guideline_index.json 또는 data/index/childcare_chunks.jsonl을 배치하세요.")
+        parts.append("\n[필수 자료 체크]")
+        hay = " ".join(docs.keys())
+        for req in REQUIRED_DOCS:
+            ok = any(tok in hay for tok in _tokenize(req))
+            parts.append(f"{'✅' if ok else '⚠️'} {req}")
+        return "\n".join(parts)
+    except Exception as e:
+        return f"색인 상태 확인 중 문제가 발생했습니다. ({type(e).__name__})"
 
 
 # ──────────────────────────────────────────────────────────────
