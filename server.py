@@ -45,6 +45,10 @@ except Exception:
     GUIDELINE_INDEX = []
 
 
+_STOP = {"있는", "하는", "해야", "되는", "관련", "대한", "그리고", "어떻게", "무엇", "알려",
+         "지침", "법령", "근거", "확인", "이것", "저것", "거야", "인지", "되나", "되어"}
+
+
 def _tokenize(s):
     try:
         return [t for t in re.findall(r"[가-힣A-Za-z0-9]+", str(s)) if len(t) >= 2]
@@ -52,11 +56,91 @@ def _tokenize(s):
         return []
 
 
-def _search_guidelines(query, topk=3, source_keyword=""):
-    """내장 지침서에서 질의 관련 조각을 점수순으로 반환. 절대 예외 없음."""
+def _ngrams(word, n=2):
+    """단어를 글자 n-gram으로. (한국어 단어 변형에도 잘 걸리도록)"""
     try:
-        qts = _tokenize(query)
-        if not qts or not GUIDELINE_INDEX:
+        w = str(word)
+        if len(w) < n:
+            return [w] if w else []
+        return [w[i:i + n] for i in range(len(w) - n + 1)]
+    except Exception:
+        return []
+
+
+import math as _math
+
+# 보육 행정 동의어 — 질문 단어와 자료 단어가 달라도 찾도록 확장
+_SYNONYMS = {
+    "부모": ["학부모", "보호자"], "부모위원": ["학부모", "보호자", "학부모대표"],
+    "학부모": ["보호자", "부모"], "보호자": ["학부모", "부모"],
+    "비율": ["2분의", "이상", "정수", "이내"], "정수": ["2분의", "이상", "이내"],
+    "교사": ["보육교사", "교직원"], "교직원": ["보육교사", "교사"],
+    "채용": ["임용", "자격", "결격"], "임용": ["채용", "자격"],
+    "집행": ["계정", "예산", "지출"], "회계": ["재무", "계정", "예산"],
+    "급식": ["위생", "식단"], "안전": ["점검", "비상", "재해"],
+    "놀이": ["영역", "배움"], "운영위원회": ["위원회", "운영위"],
+}
+
+_DF = None
+_NDOCS = 0
+
+
+def _build_df():
+    """글자 2-gram의 문서빈도(DF)를 1회 계산. 실패해도 안전(빈 표)."""
+    global _DF, _NDOCS
+    if _DF is not None:
+        return
+    df = {}
+    try:
+        _NDOCS = len(GUIDELINE_INDEX)
+        for item in GUIDELINE_INDEX:
+            txt = item.get("text", "")
+            seen = set()
+            for i in range(len(txt) - 1):
+                seen.add(txt[i:i + 2])
+            for g in seen:
+                df[g] = df.get(g, 0) + 1
+    except Exception:
+        df = {}
+    _DF = df
+
+
+def _idf(g):
+    try:
+        if not _DF or _NDOCS <= 0:
+            return 1.0
+        return _math.log((_NDOCS + 1) / (_DF.get(g, 0) + 1)) + 1.0
+    except Exception:
+        return 1.0
+
+
+def _query_concepts(query):
+    """질의 → [(핵심단어, 그 개념의 동의어 포함 2-gram 집합), ...]."""
+    words = [w for w in _tokenize(query) if w not in _STOP]
+    concepts = []
+    for w in words:
+        terms = [w] + _SYNONYMS.get(w, [])
+        grams = set()
+        for t in terms:
+            for tok in _tokenize(t):
+                for g in _ngrams(tok, 2):
+                    grams.add(g)
+        concepts.append((w, grams))
+    return concepts
+
+
+def _search_guidelines(query, topk=5, source_keyword=""):
+    """개념 커버리지 우선 + IDF 가중 검색.
+
+    핵심은 '질의가 담은 여러 개념을 두루 맞힌 문단'을 우선하는 것.
+    예: '운영위원회 + 부모 + 비율'을 모두 건드린 문단(=학부모 2분의 1 이상 규정)이,
+    '운영위원회 + 위반'만 맞은 처분 안내 문단보다 위로 온다.
+    흔한 글자는 약하게(낮은 IDF), 희귀한 글자(2분의 등)는 강하게 반영. 절대 예외 없음.
+    """
+    try:
+        _build_df()
+        concepts = _query_concepts(query)
+        if not concepts or not GUIDELINE_INDEX:
             return []
         scored = []
         for item in GUIDELINE_INDEX:
@@ -65,11 +149,23 @@ def _search_guidelines(query, topk=3, source_keyword=""):
                 src = item.get("source", "")
                 if source_keyword and source_keyword not in src:
                     continue
-                score = sum(txt.count(t) for t in qts)
-                if all(t in txt for t in qts):
-                    score += 5
-                if score > 0:
-                    scored.append((score, item))
+                score = 0.0
+                any_match = False
+                for w, grams in concepts:
+                    best = 0.0          # 이 개념을 맞힌 글자 중 '가장 특징적인(희귀한)' 값
+                    for g in grams:
+                        if g in txt:
+                            idf = _idf(g)
+                            if idf > best:
+                                best = idf
+                    if best > 0:
+                        any_match = True
+                        score += best   # 개념마다 최고값만 더함 → 흔한 글자 남발에 안 휘둘림
+                    if len(w) >= 2 and w in txt:
+                        score += 2.0     # 핵심 단어 통째 일치 보너스
+                if not any_match:
+                    continue
+                scored.append((score, item))
             except Exception:
                 continue
         scored.sort(key=lambda x: -x[0])
@@ -140,13 +236,16 @@ def search_law_and_guidelines(질의: str) -> str:
           누리과정)과 법제처 관련 법령명을 근거로 제공합니다. 호스트 AI는 이 근거로
           해결책을 작성하고 출처(지침서명/법령명)를 반드시 함께 안내하세요. 근거에 없는
           내용은 단정하지 마세요.
+          ★검색 팁: 질의는 문장 전체보다 '핵심 명사' 위주가 정확합니다
+          (예: '운영위원회 보호자 비율', '교재교구비 집행 기준'). 원하는 근거가 안 보이면
+          핵심어를 바꿔 한 번 더 호출하세요.
 
     Args:
-        질의: 알고 싶은 내용 (예: "운영위원회 구성", "예산 편성 절차", "표준보육과정 5개 영역")
+        질의: 알고 싶은 핵심어 (예: "운영위원회 보호자 비율", "예산 편성 절차", "표준보육과정 5개 영역")
     """
     try:
         parts = []
-        hits = _search_guidelines(질의, topk=3)
+        hits = _search_guidelines(질의, topk=6)
         if hits:
             parts.append("[지침서 근거]")
             for h in hits:
@@ -173,43 +272,81 @@ def search_law_and_guidelines(질의: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # Tool 2. 회계 집행 검증  ★검증 중심 핵심
 # ──────────────────────────────────────────────────────────────
+# 어린이집 세출(지출) 예산 과목 구분 — 2025 재무회계 매뉴얼 CHAPTER Ⅲ 전체(관-항-목)
+ACCOUNT_TABLE = (
+    "[어린이집 세출(지출) 예산 과목 구분 — 관(款)·항(項)·목(目)]\n"
+    "■ 인건비(100관)\n"
+    "  · 원장인건비(110항): 원장급여(111목) / 원장수당(112목)\n"
+    "  · 보육교직원인건비(120항): 보육교직원급여(121목) / 보육교직원수당(122목)\n"
+    "  · 기타인건비(130항): 기타인건비(131목)\n"
+    "  · 기관부담금(140항): 법정부담금(141목) / 퇴직금및퇴직적립금(142목)\n"
+    "■ 운영비(200관)\n"
+    "  · 관리운영비(210항): 수용비및수수료(211목) / 공공요금및제세공과금(212목) / 연료비(213목) / "
+    "여비(214목) / 차량비(215목) / 복리후생비(216목) / 기타운영비(217목)\n"
+    "  · 업무추진비(220항): 업무추진비(221목) / 직책급(222목) / 회의비(223목)\n"
+    "■ 보육활동비(300관)\n"
+    "  · 기본보육활동비(310항): 교직원연수·연구비(311목) / 교재·교구구입비(312목) / 행사비(313목) / "
+    "영유아복리비(314목) / 급식·간식재료비(315목)\n"
+    "■ 수익자부담경비(400관)\n"
+    "  · 선택적보육활동비(410항): 특별활동비지출(411목)\n"
+    "  · 기타필요경비(420항): 기타필요경비지출(421목)\n"
+    "■ 적립금(500관): 적립금(510항)>적립금(511목)\n"
+    "■ 상환·반환금(600관)\n"
+    "  · 차입금상환(610항): 단기차입금상환(611목) / 장기차입금상환(612목)\n"
+    "  · 반환금(620항): 보조금반환금(621목) / 보호자반환금(622목) / 법인회계전출금(623목)\n"
+    "■ 재산조성비(700관)\n"
+    "  · 시설비(710항): 시설비(711목) / 시설장비유지비(712목)\n"
+    "  · 자산구입비(720항): 자산취득비(721목)\n"
+    "■ 과년도지출(800관): 과년도지출(811목)  ■ 잡지출(900관): 잡지출(911목)  "
+    "■ 예비비(1000관): 예비비(1011목)\n"
+    "※ 참고: 회의비(223목)는 업무추진비(220항) 아래의 목이며, 매뉴얼 예시에 운영위원회·학부모회의·"
+    "교사회의가 회의비로 명시됨(매뉴얼 p.71). 직책급(222목)은 원장 직책수당."
+)
+
+
 @mcp.tool()
 def verify_accounting(지출내용: str, 계정과목: str = "", 비고: str = "") -> str:
-    """어린이집 회계 집행의 적정성을 재무회계 매뉴얼 근거로 검증하도록 돕습니다.
+    """어린이집 회계 집행의 적정성을 재무회계 매뉴얼의 '관-항-목' 근거로 검증하도록 돕습니다.
 
-    [트리거] "회계 검증", "이 계정 맞아?", "계정과목", "집행", "집행률", "예산 위반",
-            "행정처분", "이 비용 처리", "목적외 사용"
-    [용도] 어떤 지출을 어떤 계정과목에 집행하는 게 맞는지, 집행률이 적정한지, 위반/행정처분
-          사항인지 판단할 근거(재무회계 규정)와 검증 체크리스트를 제공합니다. 호스트 AI는
-          이를 바탕으로 '적정 / 부적정 / 추가확인 필요'를 판단해 안내하세요.
+    [트리거] "회계 검증", "이 계정 맞아?", "계정과목", "어느 과목", "집행", "집행률",
+            "예산 위반", "행정처분", "이 비용 처리", "목적외 사용", "관 항 목"
+    [용도] 어떤 지출을 어느 '관-항-목'에 집행하는 게 맞는지, 집행이 적정한지, 위반/행정처분
+          사항인지 판단할 근거(재무회계 규정 원문 + 전체 과목 구분표)를 제공합니다.
+
+    호스트 AI 필수 규칙:
+      - 계정과목은 반드시 '관 > 항 > 목' 3단계를 모두 표기. (예: 운영비(200관) > 업무추진비(220항)
+        > 회의비(223목)) 한 단계라도 생략 금지.
+      - 매뉴얼 근거 원문과 산출기초 예시·관련근거 페이지를 함께 인용.
+      - 근거에서 확정되지 않으면 단정하지 말고 '추가확인 필요'로 안내.
 
     Args:
-        지출내용: 검증할 지출/물품 (예: "교사 워크숍 식대", "교재교구 구입")
-        계정과목: 집행하려는(또는 집행한) 계정과목 (예: "운영비", "교재교구비")
+        지출내용: 검증할 지출/물품 (예: "교사회의비", "교재교구 구입", "원장 직책수당")
+        계정과목: 집행하려는(또는 집행한) 계정과목 (예: "운영비", "회의비")
         비고: 추가 상황 (예: "예산 80% 집행 상태")
     """
     try:
-        q = " ".join([x for x in [지출내용, 계정과목, 비고] if x]).strip() or 지출내용
-        hits = _search_guidelines(q, topk=3, source_keyword="재무회계")
+        q = " ".join([x for x in [지출내용, 계정과목, 비고] if x]).strip() or str(지출내용)
+        hits = _search_guidelines(q, topk=4, source_keyword="재무회계")
         if not hits:
-            hits = _search_guidelines(q, topk=2)
+            hits = _search_guidelines(q, topk=3)
         head = "[회계 집행 검증]  지출: " + str(지출내용)
         if 계정과목:
             head += "  /  계정과목(안): " + str(계정과목)
         parts = [head]
         if hits:
-            parts.append("\n[관련 재무회계 규정 근거]")
+            parts.append("\n[매뉴얼 근거 — 해당 과목 원문]")
             for h in hits:
                 parts.append("\n▷ 출처: " + h["source"] + "\n" + h["text"])
         else:
-            parts.append("\n관련 규정을 못 찾았어요. 지출내용/계정과목을 더 구체적으로 적어보세요.")
+            parts.append("\n관련 규정을 못 찾았어요. 지출내용을 더 구체적으로 적어보세요.")
+        parts.append("\n\n" + ACCOUNT_TABLE)
         parts.append(
-            "\n\n[검증 포인트 — 호스트 AI가 위 근거로 판단]\n"
-            "1. 계정과목 적정성: 이 지출이 해당 계정과목 정의에 맞는지 대조\n"
+            "\n[검증 포인트 — 호스트 AI가 위 근거로 판단]\n"
+            "1. 계정과목 적정성: 지출 성격에 맞는 '관 > 항 > 목'을 위 표에서 정확히 찾아 3단계 모두 표기\n"
             "2. 집행률: 예산 대비 집행률이 적정한지(과다·과소·목적외 여부)\n"
-            "3. 위반·행정처분: 목적외 사용·부적정 집행이면 영유아보육법·사회복지시설 재무회계규칙상 "
-            "시정명령·반환·행정처분 대상일 수 있음 → search_law_and_guidelines로 근거 확인\n"
-            "※ 단정이 어려우면 '추가확인 필요'로 안내하고 확인 방법을 함께 제시하세요."
+            "3. 위반·행정처분: 목적외 사용·부적정 집행이면 영유아보육법(제38조의2 목적외 사용금지 등)·"
+            "사회복지시설 재무회계규칙상 시정명령·반환·행정처분 대상일 수 있음 → search_law_and_guidelines로 확인\n"
+            "※ 확정 곤란 시 '추가확인 필요' + 확인 방법 안내. 단정 금지."
         )
         return "\n".join(parts)
     except Exception:
